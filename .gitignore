@@ -23,3 +23,7 @@ target
 # golden-vector tooling
 node_modules/
 .env
+
+# Python tooling (scripts/)
+__pycache__/
+*.pyc
