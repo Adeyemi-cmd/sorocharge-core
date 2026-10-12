@@ -1,7 +1,7 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use stellar_xdr::{
-    ScAddress, ScSymbol, ScVal, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
-    SorobanCredentials,
+    AccountId, PublicKey, ScAddress, ScSymbol, ScVal, SorobanAuthorizedFunction,
+    SorobanAuthorizedInvocation, SorobanCredentials, Uint256,
 };
 
 use crate::entry::{Address, ChargeParams};
@@ -116,13 +116,25 @@ fn extract_account_signature(scval: &ScVal) -> Option<([u8; 32], [u8; 64])> {
     Some((public_key?, signature?))
 }
 
+/// Checks `scval` carries a genuine ed25519 signature over `payload` **made
+/// by `address`'s own key** — not just a genuine signature by *some* key.
+/// The embedded `public_key` field in the signature SCVal is caller-supplied
+/// data, not a verified fact; skipping the comparison against `address`'s
+/// actual `AccountId` would let anyone attach a valid signature from an
+/// unrelated keypair while the entry still claims `address` as the
+/// authorizing account.
 fn is_valid_ed25519_signature(address: &Address, payload: &[u8; 32], scval: &ScVal) -> bool {
-    let ScAddress::Account(_) = address else {
+    let ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key)))) =
+        address
+    else {
         return false;
     };
     let Some((public_key_bytes, signature_bytes)) = extract_account_signature(scval) else {
         return false;
     };
+    if public_key_bytes != *account_key {
+        return false;
+    }
     let Ok(verifying_key) = VerifyingKey::from_bytes(&public_key_bytes) else {
         return false;
     };
@@ -415,6 +427,48 @@ mod tests {
 
         let result = verify_entry(
             &tampered,
+            &f.expected,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(result, Err(SorochargeError::InvalidSignature));
+    }
+
+    #[test]
+    fn rejects_a_genuine_signature_from_a_key_other_than_the_claimed_account() {
+        use ed25519_dalek::{Signer as DalekSigner, SigningKey};
+
+        let f = load();
+        let xdr_entry = f.signed.as_xdr().clone();
+        let SorobanCredentials::Address(mut creds) = xdr_entry.credentials.clone() else {
+            panic!("expected legacy Address credentials in this fixture");
+        };
+
+        // Key B signs the exact same payload the fixture's real signature
+        // (by key A, the claimed payer) covers — a cryptographically
+        // genuine signature, just not one made by the account this entry
+        // claims to be authorized by.
+        let payload = signing_payload(
+            &xdr_entry.credentials,
+            &xdr_entry.root_invocation,
+            &f.network_passphrase,
+        )
+        .expect("fixture payload should reconstruct");
+        let other_signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let other_signature = other_signing_key.sign(&payload).to_bytes();
+        creds.signature = build_account_signature_scval(
+            other_signing_key.verifying_key().to_bytes(),
+            other_signature,
+        )
+        .unwrap();
+
+        let forged = SignedEntry(SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(creds),
+            root_invocation: xdr_entry.root_invocation,
+        });
+
+        let result = verify_entry(
+            &forged,
             &f.expected,
             f.valid_until_ledger - 1,
             &f.network_passphrase,
