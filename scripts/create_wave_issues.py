@@ -83,6 +83,11 @@ def label_for(it: dict) -> list[str]:
         "perf": "enhancement", "ci": "enhancement", "research": "question",
     }.get(it["title"].split(":")[0].split("(")[0], "enhancement")
     labels.append(type_label)
+    # Complexity label: GitHub's own "good first issue" already exists;
+    # "high"/"medium"/"low" do not by default and must be created once
+    # per repo (see scripts/backfill_complexity_labels.py, which also
+    # backfills this onto any issue created before this label existed).
+    labels.append({"high": "high", "medium": "medium", "trivial": "low"}[it["complexity"]])
     if it.get("good_first_issue"):
         labels.append("good first issue")
     return labels
@@ -108,6 +113,25 @@ def body_for(it: dict) -> str:
     return "\n".join(lines)
 
 
+def ensure_complexity_labels_exist(repo: str) -> None:
+    """high/medium/low aren't in GitHub's default label set — create them
+    once if missing, so --label doesn't fail on a repo that's never run
+    this script before."""
+    colors = {"high": "d93f0b", "medium": "fbca04", "low": "0e8a16"}
+    result = subprocess.run(
+        ["gh", "label", "list", "--repo", repo, "--limit", "200", "--json", "name"],
+        capture_output=True, text=True, check=True,
+    )
+    existing = {row["name"] for row in json.loads(result.stdout)}
+    for name, color in colors.items():
+        if name not in existing:
+            subprocess.run(
+                ["gh", "label", "create", name, "--repo", repo, "--color", color,
+                 "--description", f"{name.capitalize()} complexity"],
+                capture_output=True, text=True, check=True,
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("backlog_json")
@@ -124,6 +148,9 @@ def main() -> int:
         return 1
 
     print(f"Validated {len(items)} issues ({sum(it['points'] for it in items)} points) against {args.repo}.")
+
+    if args.apply:
+        ensure_complexity_labels_exist(args.repo)
 
     try:
         already = existing_titles(args.repo)
