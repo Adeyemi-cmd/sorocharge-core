@@ -303,4 +303,44 @@ mod tests {
             Err(SorochargeError::SimulationEventsMalformed { .. })
         ));
     }
+
+    #[test]
+    fn rejects_a_transfer_event_lacking_from_to_address_topics() {
+        let f = load();
+        let (asset, payer, recipient, amount) = expected(&f);
+        let mut events = f.diagnostic_events_xdr_base64.clone();
+        let idx = events.iter().position(|e| is_transfer_event(e)).unwrap();
+        // Keep only the "transfer" symbol topic, dropping the from/to addresses.
+        events[idx] = edited_transfer(&events[idx], |ev| {
+            let Body::V0(v0) = &mut ev.event.body;
+            v0.topics = VecM::try_from(vec![v0.topics[0].clone()]).unwrap();
+        });
+        let result = verify_transfer_effects(&events, &asset, &payer, &recipient, amount);
+        assert_eq!(
+            result,
+            Err(SorochargeError::SimulationEventsMalformed {
+                reason: "transfer event lacks from/to address topics".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_a_transfer_event_whose_data_is_not_an_i128() {
+        let f = load();
+        let (asset, payer, recipient, amount) = expected(&f);
+        let mut events = f.diagnostic_events_xdr_base64.clone();
+        let idx = events.iter().position(|e| is_transfer_event(e)).unwrap();
+        // The transfer amount must be an ScVal::I128; anything else is malformed.
+        events[idx] = edited_transfer(&events[idx], |ev| {
+            let Body::V0(v0) = &mut ev.event.body;
+            v0.data = ScVal::I64(1_000_000);
+        });
+        let result = verify_transfer_effects(&events, &asset, &payer, &recipient, amount);
+        assert_eq!(
+            result,
+            Err(SorochargeError::SimulationEventsMalformed {
+                reason: "transfer event data is not an i128".to_string(),
+            })
+        );
+    }
 }
