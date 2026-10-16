@@ -23,3 +23,23 @@ pub fn caip2_for_passphrase(network_passphrase: &str) -> Result<&'static str, X4
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A passphrase with no CAIP-2 mapping must surface as exactly
+    /// `UnsupportedNetwork`, carrying the offending identifier back so a
+    /// caller can tell it apart from every other `X402Error` variant.
+    #[test]
+    fn rejects_a_passphrase_with_no_caip2_mapping() {
+        let unknown = "Future SDF Network ; September 2035";
+
+        match caip2_for_passphrase(unknown) {
+            Err(X402Error::UnsupportedNetwork { network }) => {
+                assert_eq!(network, unknown);
+            }
+            other => panic!("expected UnsupportedNetwork, got {other:?}"),
+        }
+    }
+}

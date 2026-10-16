@@ -386,4 +386,99 @@ mod tests {
             Err(X402Error::UnexpectedTransactionShape { .. })
         ));
     }
+
+    /// A `Signer` whose key fails must surface as exactly `Signing`, so a
+    /// caller can tell a key failure apart from every other `X402Error`.
+    #[test]
+    fn sign_transaction_propagates_signer_failures_as_signing() {
+        struct FailingSigner {
+            address: Address,
+        }
+
+        impl Signer for FailingSigner {
+            fn sign_preimage(
+                &self,
+                _preimage: &[u8],
+            ) -> Result<[u8; 64], sorocharge_signer::SorochargeError> {
+                Err(sorocharge_signer::SorochargeError::SigningFailed {
+                    reason: "boom".to_string(),
+                })
+            }
+
+            fn address(&self) -> Address {
+                self.address.clone()
+            }
+        }
+
+        let params = test_params();
+        let good = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &good, "Test SDF Network ; September 2015").unwrap();
+        let envelope = build_payment_transaction_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(v1) = envelope else {
+            unreachable!("build_payment_transaction_envelope always returns a v1 envelope")
+        };
+
+        let failing = FailingSigner {
+            address: params.payer.clone(),
+        };
+        match sign_transaction(v1.tx, &failing, [0u8; 32]) {
+            Err(X402Error::Signing(_)) => {}
+            other => panic!("expected Signing, got {other:?}"),
+        }
+    }
+
+    /// A signer whose address is not an Ed25519 account cannot become a
+    /// transaction source, so `sign_transaction` must fail as exactly
+    /// `XdrEncodingFailed` — a value that does not fit its XDR-constrained
+    /// shape, not a signing or shape error.
+    #[test]
+    fn sign_transaction_rejects_a_non_account_signer_as_xdr_encoding_failed() {
+        use stellar_xdr::ContractId;
+
+        struct ContractSigner {
+            address: Address,
+        }
+
+        impl Signer for ContractSigner {
+            fn sign_preimage(
+                &self,
+                _preimage: &[u8],
+            ) -> Result<[u8; 64], sorocharge_signer::SorochargeError> {
+                Ok([0u8; 64])
+            }
+
+            fn address(&self) -> Address {
+                self.address.clone()
+            }
+        }
+
+        let params = test_params();
+        let good = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &good, "Test SDF Network ; September 2015").unwrap();
+        let envelope = build_payment_transaction_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(v1) = envelope else {
+            unreachable!("build_payment_transaction_envelope always returns a v1 envelope")
+        };
+
+        let contract_signer = ContractSigner {
+            address: ScAddress::Contract(ContractId(stellar_xdr::Hash([0xabu8; 32]))),
+        };
+        match sign_transaction(v1.tx, &contract_signer, [0u8; 32]) {
+            Err(X402Error::XdrEncodingFailed { reason }) => {
+                assert!(
+                    reason.contains("Ed25519 account"),
+                    "expected the facilitator-signer reason, got {reason:?}"
+                );
+            }
+            other => panic!("expected XdrEncodingFailed, got {other:?}"),
+        }
+    }
 }
