@@ -381,7 +381,7 @@ impl<'a> MppServer<'a> {
         } else if let Preconditions::Time(bounds) = &tx.cond {
             let max_allowed = expires_at
                 .map(|e| u64::try_from(e.timestamp()).unwrap_or(0))
-                .unwrap_or(DEFAULT_CHALLENGE_EXPIRY_SECONDS as u64);
+                .unwrap_or(DEFAULT_CHALLENGE_EXPIRY_SECONDS);
             if bounds.max_time.0 > max_allowed {
                 return Err(MppError::VerificationFailed {
                     reason: "timeBounds.maxTime exceeds the challenge expiry".to_string(),
