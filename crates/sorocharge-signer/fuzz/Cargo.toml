@@ -1,0 +1,33 @@
+[package]
+name = "sorocharge-signer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+stellar-xdr = { version = "=28.0.0", features = ["std", "serde", "base64"] }
+
+[dependencies.sorocharge-signer]
+path = ".."
+
+# Detach from the root workspace: cargo-fuzz requires nightly Rust and a
+# libFuzzer runtime, while the library itself stays on the stable 1.98.1 pin
+# in the root `rust-version`. `[workspace]` here means `cargo build/test
+# --workspace` at the repo root never tries to compile these targets, and it
+# keeps `fuzz/` out of the published crate.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "verify_entry"
+path = "fuzz_targets/verify_entry.rs"
+test = false
+doc = false
+bench = false
