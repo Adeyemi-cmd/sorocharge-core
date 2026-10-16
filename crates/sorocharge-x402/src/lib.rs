@@ -13,5 +13,6 @@ pub use facilitator::{Facilitator, FacilitatorConfig};
 pub use types::{
     PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo, SettleRequest,
     SettlementResponse, StellarExtra, StellarPayload, SupportedKind, SupportedResponse,
-    VerifyRequest, VerifyResponse,
+    VerifyRequest, VerifyResponse, MAX_AMOUNT_LEN, MAX_DESCRIPTION_LEN, MAX_ERROR_MESSAGE_LEN,
+    MAX_MIME_TYPE_LEN, MAX_NETWORK_LEN, MAX_SCHEME_LEN, MAX_STRKEY_LEN, MAX_URL_LEN,
 };
