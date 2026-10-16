@@ -225,3 +225,112 @@ impl X402Client {
         Ok(second)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use stellar_xdr::{
+        HostFunction, MuxedAccount, OperationBody, ReadXdr, SorobanCredentials,
+        TransactionEnvelope, Uint256,
+    };
+
+    use crate::test_util::{MockResource, TestSigner};
+    use crate::types::{ResourceInfo, StellarExtra};
+
+    const NETWORK: &str = "Test SDF Network ; September 2015";
+    const ASSET: &str = "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH";
+    const PAY_TO: &str = "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N";
+
+    fn payment_required(network: &str) -> PaymentRequired {
+        PaymentRequired {
+            x402_version: 2,
+            error: None,
+            resource: ResourceInfo {
+                url: "http://127.0.0.1/resource".to_string(),
+                description: None,
+                mime_type: None,
+            },
+            accepts: vec![PaymentRequirements {
+                scheme: "exact".to_string(),
+                network: network.to_string(),
+                amount: "42000000".to_string(),
+                asset: ASSET.to_string(),
+                pay_to: PAY_TO.to_string(),
+                max_timeout_seconds: 60,
+                extra: StellarExtra {
+                    are_fees_sponsored: true,
+                },
+            }],
+            extensions: serde_json::Map::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn returns_200_and_retries_with_a_payment_signature() {
+        let resource = MockResource::spawn(payment_required("stellar:testnet")).await;
+        let client = X402Client::new(Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x55; 32]);
+
+        let response = client
+            .get_with_payment(&resource.url, &signer, NETWORK, 1_000)
+            .await
+            .expect("payment flow");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(resource.request_count(), 2);
+
+        let signature = resource.captured_signature();
+        let bytes = BASE64
+            .decode(signature.trim())
+            .expect("base64-decode the header");
+        let payload: PaymentPayload = serde_json::from_slice(&bytes).expect("decode the payload");
+        assert_eq!(payload.x402_version, 2);
+        assert_eq!(payload.accepted.network, "stellar:testnet");
+        assert_eq!(payload.accepted.amount, "42000000");
+
+        let envelope =
+            TransactionEnvelope::from_xdr_base64(&payload.payload.transaction, Limits::none())
+                .expect("decode the payment envelope");
+        let TransactionEnvelope::Tx(v1) = envelope else {
+            panic!("expected a v1 envelope");
+        };
+        assert_eq!(
+            v1.tx.source_account,
+            MuxedAccount::Ed25519(Uint256([0u8; 32]))
+        );
+        let [operation] = v1.tx.operations.as_slice() else {
+            panic!("expected exactly one operation");
+        };
+        let OperationBody::InvokeHostFunction(invoke) = &operation.body else {
+            panic!("expected an invokeHostFunction operation");
+        };
+        assert!(matches!(
+            invoke.host_function,
+            HostFunction::InvokeContract(_)
+        ));
+        let [auth_entry] = invoke.auth.as_slice() else {
+            panic!("expected exactly one authorization entry");
+        };
+        assert!(matches!(
+            auth_entry.credentials,
+            SorobanCredentials::Address(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_when_no_accepts_entry_matches_the_network() {
+        let resource = MockResource::spawn(payment_required("stellar:pubnet")).await;
+        let client = X402Client::new(Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x55; 32]);
+
+        let result = client
+            .get_with_payment(&resource.url, &signer, NETWORK, 1_000)
+            .await;
+
+        assert!(
+            matches!(result, Err(X402Error::NoAcceptablePaymentRequirements)),
+            "expected NoAcceptablePaymentRequirements, got {result:?}"
+        );
+        assert_eq!(resource.request_count(), 1);
+    }
+}

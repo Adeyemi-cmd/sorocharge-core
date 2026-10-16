@@ -3,7 +3,9 @@
 //! sponsored or unsponsored), and retry with the credential attached.
 
 use chrono::{DateTime, Utc};
-use sorocharge_signer::{build_charge_entry, sign_entry, ChargeParams, CredentialKind, Signer};
+use sorocharge_signer::{
+    build_charge_entry, network_id_hash, sign_entry, ChargeParams, CredentialKind, Signer,
+};
 use stellar_xdr::{
     AccountId, Limits, PublicKey, ReadXdr, ScAddress, SorobanTransactionData, WriteXdr,
 };
@@ -17,11 +19,6 @@ use crate::types::{Challenge, ChargeRequest, Credential, Payload};
 const DEFAULT_ESTIMATED_LEDGER_SECONDS: u64 = 5;
 const DEFAULT_CHALLENGE_EXPIRY_SECONDS: i64 = 300;
 const SETTLEMENT_FEE_BUFFER_STROOPS: i64 = 100;
-
-fn network_id_hash(network_passphrase: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(network_passphrase.as_bytes()).into()
-}
 
 fn parse_expires(expires: Option<&str>) -> DateTime<Utc> {
     expires
@@ -333,5 +330,120 @@ impl<'a> MppClient<'a> {
             });
         }
         Ok(second)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+    use std::time::Duration;
+    use stellar_xdr::{AccountId, MuxedAccount, Preconditions, TransactionEnvelope, Uint256};
+
+    use crate::test_util::{MockResource, MockRpc, TestSigner};
+    use crate::types::MethodDetails;
+
+    const NETWORK: &str = "Test SDF Network ; September 2015";
+    const CURRENT_LEDGER: u32 = 1_000;
+    const ACCOUNT_SEQ_NUM: i64 = 5;
+    const ASSET_CONTRACT: &str = "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH";
+    const RECIPIENT: &str = "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N";
+    const AMOUNT: i128 = 42_000_000;
+
+    fn charge_request(fee_payer: bool) -> ChargeRequest {
+        ChargeRequest {
+            amount: AMOUNT.to_string(),
+            currency: ASSET_CONTRACT.to_string(),
+            recipient: RECIPIENT.to_string(),
+            description: None,
+            external_id: None,
+            method_details: MethodDetails {
+                network: "stellar:testnet".to_string(),
+                fee_payer,
+            },
+        }
+    }
+
+    fn expires_in(seconds: i64) -> String {
+        (Utc::now() + ChronoDuration::seconds(seconds)).to_rfc3339()
+    }
+
+    fn transaction_from(credential: &Credential) -> TransactionEnvelope {
+        let Payload::Transaction { transaction } = &credential.payload else {
+            panic!("expected a transaction payload");
+        };
+        TransactionEnvelope::from_xdr_base64(transaction, Limits::none()).expect("decode envelope")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sponsored_flow_builds_a_placeholder_source_transaction() {
+        let resource = MockResource::spawn(charge_request(true), Some(expires_in(300))).await;
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        let response = client
+            .get_with_payment(&resource.url, &signer, NETWORK)
+            .await
+            .expect("payment flow");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(resource.request_count(), 2);
+
+        let TransactionEnvelope::Tx(v1) = transaction_from(&resource.captured_credential()) else {
+            panic!("expected a v1 envelope");
+        };
+        assert_eq!(
+            v1.tx.source_account,
+            MuxedAccount::Ed25519(Uint256([0u8; 32])),
+            "sponsored transactions must use the all-zeros placeholder source"
+        );
+        assert_eq!(v1.tx.seq_num.0, 0);
+        assert_eq!(v1.tx.fee, 0);
+        // The sponsored path never needs the payer's account or a simulation.
+        assert_eq!(rpc.methods(), vec!["getLatestLedger"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsponsored_flow_builds_a_real_sequence_and_time_bounds() {
+        let resource = MockResource::spawn(charge_request(false), Some(expires_in(300))).await;
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        let response = client
+            .get_with_payment(&resource.url, &signer, NETWORK)
+            .await
+            .expect("payment flow");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let TransactionEnvelope::Tx(v1) = transaction_from(&resource.captured_credential()) else {
+            panic!("expected a v1 envelope");
+        };
+
+        let ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(payer_key)))) =
+            signer.address()
+        else {
+            panic!("the test signer must be an account");
+        };
+        assert_eq!(
+            v1.tx.source_account,
+            MuxedAccount::Ed25519(Uint256(payer_key))
+        );
+        assert_eq!(v1.tx.seq_num.0, ACCOUNT_SEQ_NUM + 1);
+        // The mock simulation reports a 100-stroop resource fee; the client
+        // adds its own 100-stroop buffer on top.
+        assert_eq!(v1.tx.fee, 200);
+
+        let Preconditions::Time(bounds) = &v1.tx.cond else {
+            panic!("unsponsored transactions must set timeBounds");
+        };
+        assert!(bounds.max_time.0 > 0);
+
+        assert_eq!(
+            rpc.methods(),
+            vec!["getLatestLedger", "getLedgerEntries", "simulateTransaction"]
+        );
     }
 }

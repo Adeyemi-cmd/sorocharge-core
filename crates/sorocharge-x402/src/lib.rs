@@ -7,6 +7,9 @@ mod network;
 mod tx;
 mod types;
 
+#[cfg(test)]
+mod test_util;
+
 pub use client::X402Client;
 pub use error::X402Error;
 pub use facilitator::{Facilitator, FacilitatorConfig};

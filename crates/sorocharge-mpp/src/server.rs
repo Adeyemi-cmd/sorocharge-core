@@ -13,7 +13,8 @@
 
 use chrono::{DateTime, Utc};
 use sorocharge_signer::{
-    verify_entry, verify_transfer_effects, Address, ChargeParams, SignedEntry, Signer,
+    network_id_hash, verify_entry, verify_transfer_effects, Address, ChargeParams, SignedEntry,
+    Signer,
 };
 use stellar_xdr::{
     Hash as XdrHash, Limits, Preconditions, ReadXdr, ScAddress, SorobanCredentials,
@@ -59,11 +60,6 @@ fn legacy_credential_fields(credentials: &SorobanCredentials) -> Result<(Address
         SorobanCredentials::Address(c) => Ok((c.address.clone(), c.signature_expiration_ledger)),
         _ => Err(MppError::ForbiddenCredentialType),
     }
-}
-
-fn network_id_hash(network_passphrase: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(network_passphrase.as_bytes()).into()
 }
 
 /// The MPP server: verifies and settles `"stellar"`/`"charge"` payments,
@@ -502,4 +498,241 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
         out[i] = u8::from_str_radix(byte_str, 16).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+    use sorocharge_signer::{build_charge_entry, sign_entry, CredentialKind};
+    use stellar_xdr::{
+        AccountId, SequenceNumber, SorobanTransactionData, TransactionV1Envelope, VecM, WriteXdr,
+    };
+
+    use crate::header::encode_base64url_jcs;
+    use crate::test_util::{MockRpc, TestSigner};
+    use crate::tx::{build_sponsored_envelope, build_unsponsored_transaction};
+    use crate::types::{Challenge, MethodDetails};
+
+    const NETWORK_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+    const CURRENT_LEDGER: u32 = 1_000;
+    const ACCOUNT_SEQ_NUM: i64 = 5;
+    const ASSET_CONTRACT: &str = "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH";
+    const RECIPIENT: &str = "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N";
+    const AMOUNT: i128 = 42_000_000;
+
+    fn charge_request(fee_payer: bool) -> ChargeRequest {
+        ChargeRequest {
+            amount: AMOUNT.to_string(),
+            currency: ASSET_CONTRACT.to_string(),
+            recipient: RECIPIENT.to_string(),
+            description: None,
+            external_id: None,
+            method_details: MethodDetails {
+                network: "stellar:testnet".to_string(),
+                fee_payer,
+            },
+        }
+    }
+
+    fn charge_params(payer: &Address, valid_until_ledger: u32) -> ChargeParams {
+        ChargeParams {
+            asset_contract: ASSET_CONTRACT.parse().expect("asset contract"),
+            amount: AMOUNT,
+            payer: payer.clone(),
+            recipient: RECIPIENT.parse().expect("recipient"),
+            valid_until_ledger,
+        }
+    }
+
+    fn signed_entry(params: &ChargeParams, signer: &TestSigner) -> SignedEntry {
+        let unsigned = build_charge_entry(params, CredentialKind::Legacy).expect("build entry");
+        sign_entry(unsigned, signer, NETWORK_PASSPHRASE).expect("sign entry")
+    }
+
+    /// A credential echoing `expected`, with no `expires` (so the server
+    /// falls back to its default challenge expiry).
+    fn credential_for(expected: &ChargeRequest, payload: Payload) -> Credential {
+        Credential {
+            challenge: Challenge {
+                id: "test-challenge".to_string(),
+                realm: "test.example".to_string(),
+                method: "stellar".to_string(),
+                intent: "charge".to_string(),
+                request: encode_base64url_jcs(expected).expect("encode charge request"),
+                description: None,
+                opaque: None,
+                digest: None,
+                expires: None,
+                header: None,
+            },
+            payload,
+            source: None,
+        }
+    }
+
+    fn account_id(address: &Address) -> AccountId {
+        match address {
+            ScAddress::Account(id) => id.clone(),
+            _ => panic!("expected an account address"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sponsored_pull_rejects_the_servers_own_address() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let server_signer = TestSigner::from_seed([0x22; 32]);
+
+        // An otherwise-valid entry, signed by the server's own key and
+        // naming the server's own address as the payer. `verify_entry`
+        // requires the authorization entry's address and the transfer's
+        // `from` to both equal `expected.payer`, so for any entry that can
+        // pass verification these two server-side checks — `transfer.from ==
+        // server` and `params.payer == server` — always hold together; this
+        // one case exercises both.
+        let valid_until = CURRENT_LEDGER + 60;
+        let params = charge_params(&server_signer.address(), valid_until);
+        let entry = signed_entry(&params, &server_signer);
+        let envelope = build_sponsored_envelope(&params, &entry).expect("sponsored envelope");
+        let transaction = envelope
+            .to_xdr_base64(Limits::none())
+            .expect("encode envelope");
+
+        let expected = charge_request(true);
+        let credential = credential_for(&expected, Payload::Transaction { transaction });
+
+        let server = MppServer::new(
+            &rpc_client,
+            &server_signer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), false)
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::ServerAddressConflict)),
+            "expected ServerAddressConflict, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_mode_credential_is_rejected_against_a_fee_paying_challenge() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let server_signer = TestSigner::from_seed([0x22; 32]);
+
+        let expected = charge_request(true);
+        let credential = credential_for(
+            &expected,
+            Payload::Hash {
+                hash: "ab".repeat(32),
+            },
+        );
+
+        let server = MppServer::new(
+            &rpc_client,
+            &server_signer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), false)
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::PushModeForbidsFeePayer)),
+            "expected PushModeForbidsFeePayer, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_mode_hash_already_consumed_is_rejected() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let server_signer = TestSigner::from_seed([0x22; 32]);
+
+        let expected = charge_request(false);
+        let credential = credential_for(
+            &expected,
+            Payload::Hash {
+                hash: "cd".repeat(32),
+            },
+        );
+
+        let server = MppServer::new(
+            &rpc_client,
+            &server_signer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), true)
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::HashAlreadyConsumed)),
+            "expected HashAlreadyConsumed, got {result:?}"
+        );
+    }
+
+    /// Regression test for the sibling fix: with no `expires` on the
+    /// challenge, an unsponsored transaction whose `maxTime` exceeds the
+    /// server's default 5-minute expiry window must be rejected rather than
+    /// silently accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsponsored_settle_without_expires_caps_time_bounds() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let payer = TestSigner::from_seed([0x33; 32]);
+
+        let valid_until = CURRENT_LEDGER + 60;
+        let params = charge_params(&payer.address(), valid_until);
+        let entry = signed_entry(&params, &payer);
+
+        let max_time =
+            u64::try_from((Utc::now() + ChronoDuration::seconds(400)).timestamp()).expect("time");
+        let tx = build_unsponsored_transaction(
+            &params,
+            &entry,
+            account_id(&payer.address()),
+            SequenceNumber(ACCOUNT_SEQ_NUM),
+            200,
+            SorobanTransactionData::default(),
+            max_time,
+        )
+        .expect("unsponsored transaction");
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+        let transaction = envelope
+            .to_xdr_base64(Limits::none())
+            .expect("encode envelope");
+
+        let expected = charge_request(false);
+        let credential = credential_for(&expected, Payload::Transaction { transaction });
+
+        let server = MppServer::new(
+            &rpc_client,
+            &payer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), false)
+            .await;
+
+        match result {
+            Err(MppError::VerificationFailed { reason }) => {
+                assert!(
+                    reason.contains("timeBounds"),
+                    "unexpected rejection reason: {reason}"
+                );
+            }
+            other => panic!("expected a timeBounds rejection, got {other:?}"),
+        }
+    }
 }

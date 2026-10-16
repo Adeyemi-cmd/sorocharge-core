@@ -11,7 +11,8 @@
 use std::collections::BTreeMap;
 
 use sorocharge_signer::{
-    verify_entry, verify_transfer_effects, Address, ChargeParams, SignedEntry, Signer,
+    network_id_hash, verify_entry, verify_transfer_effects, Address, ChargeParams, SignedEntry,
+    Signer,
 };
 use stellar_xdr::{
     AccountId, Limits, PublicKey, ReadXdr, ScAddress, SequenceNumber, SorobanCredentials,
@@ -451,9 +452,4 @@ fn tx_source_matches(source: &stellar_xdr::MuxedAccount, address: &Address) -> b
         stellar_xdr::MuxedAccount::Ed25519(Uint256(bytes)) => bytes == address_bytes,
         stellar_xdr::MuxedAccount::MuxedEd25519(m) => &m.ed25519.0 == address_bytes,
     }
-}
-
-fn network_id_hash(network_passphrase: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(network_passphrase.as_bytes()).into()
 }
