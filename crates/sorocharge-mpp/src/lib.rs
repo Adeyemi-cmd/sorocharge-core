@@ -17,6 +17,9 @@ mod server;
 mod tx;
 mod types;
 
+#[cfg(test)]
+mod test_util;
+
 pub use client::MppClient;
 pub use error::MppError;
 pub use server::{MppServer, MppServerConfig};

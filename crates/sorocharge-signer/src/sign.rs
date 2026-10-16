@@ -53,8 +53,21 @@ impl SignedEntry {
     }
 }
 
+/// The 32-byte SHA-256 of a network passphrase — Stellar's `network_id`,
+/// the value binding every signed transaction and authorization entry to
+/// exactly one network.
+///
+/// Exported so the protocol crates' settlement paths derive the same value
+/// this crate bakes into each signing payload, rather than each carrying
+/// its own copy of the identical five lines (a drift risk this project's
+/// "one audited signing engine, not two" brief exists to prevent).
+#[must_use]
+pub fn network_id_hash(network_passphrase: &str) -> [u8; 32] {
+    Sha256::digest(network_passphrase.as_bytes()).into()
+}
+
 fn compute_network_id(network_passphrase: &str) -> Hash {
-    Hash(Sha256::digest(network_passphrase.as_bytes()).into())
+    Hash(network_id_hash(network_passphrase))
 }
 
 /// The `(nonce, signature_expiration_ledger, address-bound-to)` fields a
@@ -426,6 +439,35 @@ mod golden_vector_tests {
         assert_eq!(
             result.unwrap_err(),
             SorochargeError::NoMatchingCredentialNode
+        );
+    }
+}
+
+#[cfg(test)]
+mod network_id_tests {
+    use super::network_id_hash;
+
+    /// Locks the exported `network_id_hash` to Stellar's well-known network
+    /// IDs, so the protocol crates' settlement paths are provably hashing a
+    /// passphrase to the same value this crate already bakes into every
+    /// signing payload.
+    #[test]
+    fn matches_the_well_known_stellar_network_ids() {
+        assert_eq!(
+            network_id_hash("Test SDF Network ; September 2015"),
+            [
+                0xce, 0xe0, 0x30, 0x2d, 0x59, 0x84, 0x4d, 0x32, 0xbd, 0xca, 0x91, 0x5c, 0x82, 0x03,
+                0xdd, 0x44, 0xb3, 0x3f, 0xbb, 0x7e, 0xdc, 0x19, 0x05, 0x1e, 0xa3, 0x7a, 0xbe, 0xdf,
+                0x28, 0xec, 0xd4, 0x72,
+            ]
+        );
+        assert_eq!(
+            network_id_hash("Public Global Stellar Network ; September 2015"),
+            [
+                0x7a, 0xc3, 0x39, 0x97, 0x54, 0x4e, 0x31, 0x75, 0xd2, 0x66, 0xbd, 0x02, 0x24, 0x39,
+                0xb2, 0x2c, 0xdb, 0x16, 0x50, 0x8c, 0x01, 0x16, 0x3f, 0x26, 0xe5, 0xcb, 0x2a, 0x3e,
+                0x10, 0x45, 0xa9, 0x79,
+            ]
         );
     }
 }
