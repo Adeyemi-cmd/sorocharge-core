@@ -242,8 +242,10 @@ pub(crate) fn build_charge_entry_with_nonce(
     credential: CredentialKind,
     nonce: i64,
 ) -> Result<UnsignedEntry, SorochargeError> {
+    if params.amount <= 0 {
+        return Err(SorochargeError::AmountNonPositive);
+    }
     let root_invocation = build_transfer_invocation(params)?;
-
     let credentials = match credential {
         CredentialKind::Legacy => {
             SorobanCredentials::Address(build_address_credentials(params, nonce))
@@ -466,5 +468,49 @@ mod golden_vector_tests {
         );
 
         assert_eq!(result, Err(SorochargeError::DuplicateDelegateSigner));
+    }
+
+    #[test]
+    fn rejects_non_positive_amount() {
+        // Test with amount = 0
+        let params = ChargeParams {
+            asset_contract: "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH"
+                .parse()
+                .unwrap(),
+            amount: 0,
+            payer: "GDIEVMRSOQV3JKZ2CNUL2RQV4TTNAISKW4NAC25PQUQKGMWJO6DTOAE7"
+                .parse()
+                .unwrap(),
+            recipient: "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N"
+                .parse()
+                .unwrap(),
+            valid_until_ledger: 1,
+        };
+        let result = build_charge_entry_with_nonce(
+            &params,
+            CredentialKind::Legacy,
+            1,
+        );
+        assert_eq!(result, Err(SorochargeError::AmountNonPositive));
+        // Test with negative amount
+        let params_neg = ChargeParams {
+            asset_contract: "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH"
+                .parse()
+                .unwrap(),
+            amount: -1,
+            payer: "GDIEVMRSOQV3JKZ2CNUL2RQV4TTNAISKW4NAC25PQUQKGMWJO6DTOAE7"
+                .parse()
+                .unwrap(),
+            recipient: "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N"
+                .parse()
+                .unwrap(),
+            valid_until_ledger: 1,
+        };
+        let result = build_charge_entry_with_nonce(
+            &params_neg,
+            CredentialKind::Legacy,
+            1,
+        );
+        assert_eq!(result, Err(SorochargeError::AmountNonPositive));
     }
 }
