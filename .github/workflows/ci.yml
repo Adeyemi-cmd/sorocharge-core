@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly at 03:17 UTC — off the top of the hour to avoid the CI rush.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -64,3 +68,38 @@ jobs:
 
       - name: Run golden-vector tests
         run: cargo test --workspace -- golden_vector
+
+  fuzz:
+    # Fuzzing needs nightly Rust and a long time budget, so it runs on the
+    # nightly schedule (or a manual dispatch) instead of blocking every PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: sorocharge-signer
+            target: verify_entry
+          - crate: sorocharge-x402
+            target: parse_payment_transaction
+          - crate: sorocharge-mpp
+            target: parse_payment_transaction
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/${{ matrix.crate }}/fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Fuzz ${{ matrix.crate }}::${{ matrix.target }}
+        # Run from inside `fuzz/` so its `rust-toolchain.toml` (nightly) is
+        # honored even if the runner's default toolchain is stable.
+        working-directory: crates/${{ matrix.crate }}/fuzz
+        # Bounded per-target budget; a crash fails the job.
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096

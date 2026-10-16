@@ -1,0 +1,4 @@
+# cargo-fuzz build and run output — never commit these.
+/target
+/artifacts
+/coverage

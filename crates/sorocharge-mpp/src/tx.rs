@@ -129,7 +129,11 @@ pub(crate) fn build_unsponsored_transaction(
 
 /// The `(contract, from, to, amount)` a SEP-41 `transfer` invocation
 /// authorizes.
-pub(crate) struct TransferArgs {
+///
+/// `pub` only so the `fuzzing`-gated re-export in `lib.rs` can name it; the
+/// enclosing `tx` module is private, so this is not part of the crate's
+/// normal public surface.
+pub struct TransferArgs {
     pub asset_contract: Address,
     pub from: Address,
     pub to: Address,
@@ -143,7 +147,7 @@ pub(crate) struct TransferArgs {
 /// pull mode. Unlike x402's `exact` scheme (which allows `AddressV2` too),
 /// this spec never mentions CAP-71 at all; it was drafted before Protocol
 /// 28 and pins to the legacy credential exclusively.
-pub(crate) fn parse_payment_transaction(
+pub fn parse_payment_transaction(
     envelope: &TransactionEnvelope,
 ) -> Result<(TransferArgs, Transaction, SorobanAuthorizationEntry), MppError> {
     let TransactionEnvelope::Tx(TransactionV1Envelope { tx, .. }) = envelope else {

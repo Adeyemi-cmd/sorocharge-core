@@ -96,7 +96,11 @@ pub(crate) fn build_payment_transaction_envelope(
 
 /// The `(contract, from, to, amount)` a SEP-41 `transfer` invocation
 /// authorizes.
-pub(crate) struct TransferArgs {
+///
+/// `pub` only so the `fuzzing`-gated re-export in `lib.rs` can name it; the
+/// enclosing `tx` module is private, so this is not part of the crate's
+/// normal public surface.
+pub struct TransferArgs {
     pub asset_contract: Address,
     pub from: Address,
     pub to: Address,
@@ -117,7 +121,7 @@ pub(crate) struct TransferArgs {
 /// — the spec explicitly forbids both for this scheme, even though
 /// `sorocharge-signer` itself can build/verify one of them (`Delegated`)
 /// for other protocols.
-pub(crate) fn parse_payment_transaction(
+pub fn parse_payment_transaction(
     envelope: &TransactionEnvelope,
 ) -> Result<(TransferArgs, Transaction, SorobanAuthorizationEntry), X402Error> {
     let TransactionEnvelope::Tx(TransactionV1Envelope { tx, .. }) = envelope else {
