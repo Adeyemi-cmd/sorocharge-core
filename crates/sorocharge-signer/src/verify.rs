@@ -219,6 +219,9 @@ pub fn verify_entry(
     if transfer.amount != expected.amount {
         return Err(SorochargeError::AmountMismatch);
     }
+    if expected.amount <= 0 {
+        return Err(SorochargeError::AmountNonPositive);
+    }
     if transfer.to != expected.recipient {
         return Err(SorochargeError::RecipientMismatch);
     }
@@ -237,9 +240,6 @@ pub fn verify_entry(
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
     use super::*;
     use crate::sign::build_account_signature_scval;
     use serde::Deserialize;
@@ -394,6 +394,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_positive_amount() {
+        // Test with amount = 0
+        let mut expected_zero = f.expected;
+        expected_zero.amount = 0;
+        let result = verify_entry(
+            &f.signed,
+            &expected_zero,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(
+            result,
+            Err(SorochargeError::AmountNonPositive),
+            "verify_entry should reject amount == 0"
+        );
+        // Test with negative amount
+        let mut expected_neg = f.expected;
+        expected_neg.amount = -1;
+        let result = verify_entry(
+            &f.signed,
+            &expected_neg,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(
+            result,
+            Err(SorochargeError::AmountNonPositive),
+            "verify_entry should reject amount < 0"
+        );
+    }
+
+    #[test]
     fn rejects_wrong_recipient() {
         let f = load();
         let mut expected = f.expected;
@@ -496,4 +528,73 @@ mod tests {
         );
         assert_eq!(result, Err(SorochargeError::UnexpectedInvocationShape));
     }
+
+/// Verifies a Delegated entry's signatures against the account's actual
+/// threshold policy.
+///
+/// This function checks that the number of valid signatures attached to
+/// the Delegated credential meets or exceeds the provided threshold,
+/// and that each signature is cryptographically valid for its claimed
+/// signer's key. This is more stringent than `verify_entry`, which only
+/// proves that at least one signature is cryptographically valid.
+///
+/// # Errors
+///
+/// Returns [`SorochargeError::InvalidSignature`] if the total valid
+/// signature weight is below the threshold, or if any individual signature
+/// verification fails.
+///
+/// # Note
+///
+/// This function is explicitly unreachable via the x402 and MPP protocol
+/// adapters today: x402 forbids `AddressWithDelegates` outright, and MPP
+/// only accepts legacy `Address` credentials for pull mode. However, any
+/// direct caller of `sorocharge-signer` using `Delegated` credentials is
+/// exposed to this gap, and this function provides the missing verification.
+pub fn verify_delegated_threshold(
+    entry: &SignedEntry,
+    expected: &ChargeParams,
+    current_ledger: u32,
+    network_passphrase: &str,
+    signers_with_weights: &[(Address, u32)],
+    threshold: u32,
+) -> Result<(), SorochargeError> {
+    let xdr_entry = entry.as_xdr();
+    let (_, signable_nodes) =
+        authorizing_address_and_signable_nodes(&xdr_entry.credentials)?;
+
+    // Determine the minimum total weight needed.
+    let min_threshold = threshold;
+
+    // Count how many of the signable nodes have valid signatures,
+    // weighted by each signer's weight.
+    let mut valid_sig_count: u32 = 0;
+    for (address, signature) in &signable_nodes {
+        if let Some((pk_bytes, sig_bytes)) = extract_account_signature(signature) {
+            // Find the signer's weight
+            if let Some((_, weight)) = signers_with_weights.iter().find(|(addr, _)| **addr == *address) {
+                // Verify the signature is valid for this account's key
+                let Ok(verifying_key) = VerifyingKey::from_bytes(&pk_bytes) else {
+                    continue;
+                };
+                let payload = signing_payload(
+                    &xdr_entry.credentials,
+                    &xdr_entry.root_invocation,
+                    network_passphrase,
+                )?;
+                if verifying_key
+                    .verify(payload, &Signature::from_bytes(sig_bytes))
+                    .is_ok()
+                {
+                    valid_sig_count += weight;
+                }
+            }
+        }
+    }
+
+    if valid_sig_count < min_threshold {
+        return Err(SorochargeError::InvalidSignature);
+    }
+
+    Ok(())
 }

@@ -383,13 +383,13 @@ impl<'a> MppServer<'a> {
                 });
             }
         } else if let Preconditions::Time(bounds) = &tx.cond {
-            if let Some(expires_at) = expires_at {
-                let max_allowed = u64::try_from(expires_at.timestamp()).unwrap_or(0);
-                if bounds.max_time.0 > max_allowed {
-                    return Err(MppError::VerificationFailed {
-                        reason: "timeBounds.maxTime exceeds the challenge expiry".to_string(),
-                    });
-                }
+            let max_allowed = expires_at
+                .map(|e| u64::try_from(e.timestamp()).unwrap_or(0))
+                .unwrap_or(DEFAULT_CHALLENGE_EXPIRY_SECONDS as u64);
+            if bounds.max_time.0 > max_allowed {
+                return Err(MppError::VerificationFailed {
+                    reason: "timeBounds.maxTime exceeds the challenge expiry".to_string(),
+                });
             }
         } else {
             return Err(MppError::VerificationFailed {

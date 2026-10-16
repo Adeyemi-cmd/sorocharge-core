@@ -242,8 +242,10 @@ pub(crate) fn build_charge_entry_with_nonce(
     credential: CredentialKind,
     nonce: i64,
 ) -> Result<UnsignedEntry, SorochargeError> {
+    if params.amount <= 0 {
+        return Err(SorochargeError::AmountNonPositive);
+    }
     let root_invocation = build_transfer_invocation(params)?;
-
     let credentials = match credential {
         CredentialKind::Legacy => {
             SorobanCredentials::Address(build_address_credentials(params, nonce))

@@ -20,7 +20,12 @@ pub const PAYMENT_SIGNATURE_HEADER: &str = "PAYMENT-SIGNATURE";
 /// `maxTimeoutSeconds` into a ledger count when the live network estimate
 /// isn't available. Matches the spec's own fallback.
 const DEFAULT_ESTIMATED_LEDGER_SECONDS: u64 = 5;
-
+/// Safety margin: the x402 client halves the spec's maxTimeoutSeconds
+/// allowance, matching the MPP client's approach. If ledgers close
+/// slower than the 5s default, a full-allowance expiry can fail the
+/// facilitator's own ExpirationExceedsAllowance check (a failure mode
+/// already observed live on testnet). The margin keeps the expiry inside
+/// the bound at the cost of a shorter authorization window.
 fn decode_header_json<T: serde::de::DeserializeOwned>(header_value: &str) -> Result<T, String> {
     let bytes = BASE64
         .decode(header_value.trim())
@@ -176,7 +181,8 @@ impl X402Client {
 
         let ledger_timeout = requirements
             .max_timeout_seconds
-            .div_ceil(DEFAULT_ESTIMATED_LEDGER_SECONDS);
+            .div_ceil(DEFAULT_ESTIMATED_LEDGER_SECONDS)
+            .div_ceil(2);
         params.valid_until_ledger =
             current_ledger.saturating_add(u32::try_from(ledger_timeout).unwrap_or(u32::MAX));
 
