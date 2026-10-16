@@ -123,6 +123,46 @@ function buildDelegatedEntry() {
   return { entry, delegateA: delegateAKeypair.publicKey(), delegateB: delegateBKeypair.publicKey() };
 }
 
+function buildManyDelegatesEntry() {
+  const delegateAKeypair = Keypair.fromRawEd25519Seed(fixedSeed(0x44));
+  const delegateCKeypair = Keypair.fromRawEd25519Seed(fixedSeed(0x66));
+  const delegateDKeypair = Keypair.fromRawEd25519Seed(fixedSeed(0x99));
+
+  const addressCredentials = new xdr.SorobanAddressCredentials({
+    address: new Address(payer).toScAddress(),
+    nonce,
+    signatureExpirationLedger: validUntilLedger,
+    signature: xdr.ScVal.scvVoid(),
+  });
+
+  // Three delegates, listed in the exact reverse of their XDR-encoded
+  // address-byte order (0x44 > 0x66 > 0x99 once encoded), so this fixture
+  // only reproduces the reference SDK's bytes if the builder really
+  // reorders them: the two-signer fixture's input happens to already be in
+  // ascending order, so it can't prove a sort happened. This trio is also
+  // chosen so that sorting by the G-address string would produce a
+  // different order than sorting by XDR bytes — the fixture is proof of
+  // the right sort key, not merely of some reorder.
+  const delegates = [
+    { address: delegateAKeypair.publicKey() },
+    { address: delegateCKeypair.publicKey() },
+    { address: delegateDKeypair.publicKey() },
+  ];
+
+  const entryWithoutDelegates = new xdr.SorobanAuthorizationEntry({
+    credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(addressCredentials),
+    rootInvocation: buildTransferInvocation(),
+  });
+
+  const entry = buildWithDelegatesEntry({
+    entry: entryWithoutDelegates,
+    validUntilLedgerSeq: validUntilLedger,
+    delegates,
+  });
+
+  return { entry, delegateSigners: delegates.map((delegate) => delegate.address) };
+}
+
 function writeFixture(name, entry, extra = {}, xdrField = "unsigned_entry_xdr_base64") {
   const fixture = {
     description: `${name}: a SorobanAuthorizationEntry for a SEP-41 transfer`,
@@ -149,6 +189,16 @@ writeFixture("delegated_transfer", delegated.entry, {
   // Listed out of sort order on purpose; the fixture's XDR reflects the
   // sorted order buildWithDelegatesEntry actually produced.
   delegate_signers: [delegated.delegateB, delegated.delegateA],
+});
+
+const manyDelegates = buildManyDelegatesEntry();
+writeFixture("delegated_transfer_many_signers", manyDelegates.entry, {
+  description:
+    "delegated_transfer_many_signers: three delegate signers listed in deliberately unsorted order, exercising the XDR-address-byte sort and duplicate detection at a scale the two-signer fixture cannot distinguish from an already-sorted input",
+  // Listed in the exact reverse of XDR-encoded address-byte order on
+  // purpose; the fixture's XDR reflects the sorted order
+  // buildWithDelegatesEntry actually produced.
+  delegate_signers: manyDelegates.delegateSigners,
 });
 
 const networkPassphrase = Networks.TESTNET;
