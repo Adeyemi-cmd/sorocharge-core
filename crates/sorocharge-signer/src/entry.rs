@@ -242,8 +242,10 @@ pub(crate) fn build_charge_entry_with_nonce(
     credential: CredentialKind,
     nonce: i64,
 ) -> Result<UnsignedEntry, SorochargeError> {
+    if params.amount <= 0 {
+        return Err(SorochargeError::AmountNonPositive);
+    }
     let root_invocation = build_transfer_invocation(params)?;
-
     let credentials = match credential {
         CredentialKind::Legacy => {
             SorobanCredentials::Address(build_address_credentials(params, nonce))
@@ -295,6 +297,20 @@ mod golden_vector_tests {
             .unwrap_or_else(|e| panic!("failed to read fixture {path}: {e}"));
         serde_json::from_str(&contents)
             .unwrap_or_else(|e| panic!("failed to parse fixture {path}: {e}"))
+    }
+
+    /// Encodes each address to its XDR bytes — the exact sort key the
+    /// reference SDK's `buildWithDelegatesEntry` uses for delegate nodes,
+    /// and the key [`build_delegated_credentials`] mirrors.
+    fn xdr_encoded_addresses(addresses: &[ScAddress]) -> Vec<Vec<u8>> {
+        addresses
+            .iter()
+            .map(|address| {
+                address
+                    .to_xdr(Limits::none())
+                    .expect("an ScAddress always encodes to XDR")
+            })
+            .collect()
     }
 
     #[test]
@@ -415,6 +431,91 @@ mod golden_vector_tests {
         );
     }
 
+    /// The three-signer fixture is what actually proves the sort: its
+    /// signers are listed in the exact reverse of their XDR-encoded byte
+    /// order (a G-address string sort would give a third, different order),
+    /// so the builder must reorder by XDR bytes to reproduce the reference
+    /// SDK's output. The two-signer fixture's input already happens to be
+    /// ascending, so it cannot distinguish "sorted" from "never touched".
+    #[test]
+    fn delegated_transfer_with_unsorted_signers_is_sorted_by_xdr_address_bytes() {
+        let fixture = load_fixture("delegated_transfer_many_signers");
+
+        let params = ChargeParams {
+            asset_contract: fixture.asset_contract.parse::<ScAddress>().unwrap(),
+            amount: fixture.amount.parse().unwrap(),
+            payer: fixture.payer.parse::<ScAddress>().unwrap(),
+            recipient: fixture.recipient.parse::<ScAddress>().unwrap(),
+            valid_until_ledger: fixture.valid_until_ledger,
+        };
+        let nonce: i64 = fixture.nonce.parse().unwrap();
+        let signers: Vec<ScAddress> = fixture
+            .delegate_signers
+            .iter()
+            .map(|s| s.parse::<ScAddress>().unwrap())
+            .collect();
+        assert!(
+            signers.len() >= 3,
+            "fixture should exercise more than the minimum two delegate signers, got {}",
+            signers.len()
+        );
+
+        // The fixture only proves a sort happened if its input isn't
+        // already in ascending order to begin with.
+        let input_bytes = xdr_encoded_addresses(&signers);
+        let mut ascending_bytes = input_bytes.clone();
+        ascending_bytes.sort();
+        assert_ne!(
+            input_bytes, ascending_bytes,
+            "fixture delegate_signers must be listed in deliberately unsorted order, or this test proves nothing about sorting"
+        );
+
+        let unsigned =
+            build_charge_entry_with_nonce(&params, CredentialKind::Delegated { signers }, nonce)
+                .expect("build_charge_entry_with_nonce should succeed for Delegated credentials");
+
+        let SorobanCredentials::AddressWithDelegates(built) = &unsigned.as_xdr().credentials else {
+            panic!("built entry should carry AddressWithDelegates credentials");
+        };
+        let output_bytes: Vec<Vec<u8>> = built
+            .delegates
+            .iter()
+            .map(|delegate| {
+                delegate
+                    .address
+                    .to_xdr(Limits::none())
+                    .expect("an ScAddress always encodes to XDR")
+            })
+            .collect();
+        assert!(
+            output_bytes.windows(2).all(|pair| pair[0] < pair[1]),
+            "delegate nodes must be strictly ascending by XDR-encoded address bytes, got {output_bytes:?}"
+        );
+        assert_eq!(
+            output_bytes, ascending_bytes,
+            "delegate nodes must be exactly the input signers reordered, never a different set"
+        );
+
+        let expected = SorobanAuthorizationEntry::from_xdr_base64(
+            &fixture.unsigned_entry_xdr_base64,
+            Limits::none(),
+        )
+        .expect("fixture XDR should decode");
+
+        let actual_bytes = unsigned
+            .as_xdr()
+            .to_xdr(Limits::none())
+            .expect("constructed entry should encode to XDR");
+        let expected_bytes = expected
+            .to_xdr(Limits::none())
+            .expect("decoded fixture should re-encode to XDR");
+
+        assert_eq!(
+            actual_bytes, expected_bytes,
+            "sorocharge-signer's three-signer Delegated unsigned entry XDR (including delegate sort order) must be byte-identical to @stellar/stellar-sdk 17.2.0's output"
+        );
+    }
+
     #[test]
     fn delegated_credential_rejects_empty_signers() {
         let params = ChargeParams {
@@ -461,6 +562,45 @@ mod golden_vector_tests {
             &params,
             CredentialKind::Delegated {
                 signers: vec![payer.clone(), payer],
+            },
+            1,
+        );
+
+        assert_eq!(result, Err(SorochargeError::DuplicateDelegateSigner));
+    }
+
+    /// The duplicate is deliberately non-adjacent in the input, so it is
+    /// only caught because [`build_delegated_credentials`] sorts by
+    /// XDR-encoded address bytes *before* scanning for duplicates — the
+    /// same order the reference SDK's `buildWithDelegatesEntry` dedups in.
+    /// With only two signers a duplicate is trivially adjacent either way,
+    /// which is why this case needs three.
+    #[test]
+    fn delegated_credential_rejects_duplicate_signers_after_sorting() {
+        let first: ScAddress = "GDDIEJRXY7JRB3CXMJ56AC5CLHJFG5E7JKXWIRDQZ756KORV64ZEEQ3N"
+            .parse()
+            .unwrap();
+        let second: ScAddress = "GDLVS6J3XQJ2FAM2QJ6HNLNW7OUKJGXOAB7UT4WQTEWZTOBFVUWERBG7"
+            .parse()
+            .unwrap();
+        let params = ChargeParams {
+            asset_contract: "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH"
+                .parse()
+                .unwrap(),
+            amount: 1,
+            payer: "GDIEVMRSOQV3JKZ2CNUL2RQV4TTNAISKW4NAC25PQUQKGMWJO6DTOAE7"
+                .parse()
+                .unwrap(),
+            recipient: "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N"
+                .parse()
+                .unwrap(),
+            valid_until_ledger: 1,
+        };
+
+        let result = build_charge_entry_with_nonce(
+            &params,
+            CredentialKind::Delegated {
+                signers: vec![first.clone(), second, first],
             },
             1,
         );

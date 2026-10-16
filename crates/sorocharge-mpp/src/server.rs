@@ -379,19 +379,9 @@ impl<'a> MppServer<'a> {
                 });
             }
         } else if let Preconditions::Time(bounds) = &tx.cond {
-            // The spec bounds `maxTime` by the challenge expiry. When the
-            // challenge omits `expires`, clients default to
-            // DEFAULT_CHALLENGE_EXPIRY (5 minutes), so cap against that same
-            // default rather than skipping the check entirely — mirroring
-            // the ledger-expiry fallback computed just above.
-            let max_allowed = expires_at.map(|e| e.timestamp()).unwrap_or_else(|| {
-                (Utc::now()
-                    + chrono::Duration::seconds(
-                        i64::try_from(DEFAULT_CHALLENGE_EXPIRY_SECONDS).unwrap_or(i64::MAX),
-                    ))
-                .timestamp()
-            });
-            let max_allowed = u64::try_from(max_allowed).unwrap_or(0);
+            let max_allowed = expires_at
+                .map(|e| u64::try_from(e.timestamp()).unwrap_or(0))
+                .unwrap_or(DEFAULT_CHALLENGE_EXPIRY_SECONDS as u64);
             if bounds.max_time.0 > max_allowed {
                 return Err(MppError::VerificationFailed {
                     reason: "timeBounds.maxTime exceeds the challenge expiry".to_string(),
