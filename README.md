@@ -188,6 +188,39 @@ node generate.mjs
 git diff --exit-code fixtures   # fixtures should already be committed and unchanged
 ```
 
+## Fuzzing
+
+Each crate has a [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
+harness under its `fuzz/` directory, covering the exact boundaries where
+untrusted network data meets this library:
+
+| Crate | Target | Boundary |
+|---|---|---|
+| `sorocharge-signer` | `verify_entry` | `SorobanAuthorizationEntry` decode → `SignedEntry::from_xdr` → `verify_entry` |
+| `sorocharge-x402` | `parse_payment_transaction` | `TransactionEnvelope` decode → x402's payment parser |
+| `sorocharge-mpp` | `parse_payment_transaction` | `TransactionEnvelope` decode → MPP's payment parser |
+
+Each target asserts only that arbitrary bytes never panic — malformed input
+must return a typed error, never crash the embedding process. Corpora are
+seeded from the golden-vector fixtures (signer) and real signed envelopes
+produced by the test suites (x402, MPP).
+
+`cargo-fuzz` requires **nightly** Rust. That requirement is scoped to the
+`fuzz/` directories (`fuzz/rust-toolchain.toml`) and does not affect the
+library's stable toolchain pin. Because rustup resolves its toolchain from the
+current directory, run `cargo fuzz` from inside the `fuzz/` directory so that
+file is honored:
+
+```sh
+rustup toolchain install nightly
+cargo install cargo-fuzz
+cd crates/sorocharge-signer/fuzz   # or sorocharge-x402/fuzz / sorocharge-mpp/fuzz
+cargo fuzz run verify_entry        # or parse_payment_transaction
+```
+
+A bounded run is wired into CI as a nightly job (not on every PR). See each
+crate's `fuzz/README.md` for how to extend its corpus.
+
 ## License
 
 Apache-2.0

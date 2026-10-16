@@ -146,9 +146,11 @@ fn is_valid_ed25519_signature(address: &Address, payload: &[u8; 32], scval: &ScV
 /// Verifies a signed charge entry against the charge it's expected to
 /// authorize, failing closed on the first mismatch, checked in this order:
 ///
-/// 1. [`SorochargeError::ExpiredEntry`] — `valid_until_ledger` has passed
+/// 1. [`SorochargeError::AmountNonPositive`] — `expected.amount` is zero or
+///    negative, which is never a valid charge regardless of the entry.
+/// 2. [`SorochargeError::ExpiredEntry`] — `valid_until_ledger` has passed
 ///    `current_ledger`.
-/// 2. [`SorochargeError::ExpirationExceedsAllowance`] — the entry's own
+/// 3. [`SorochargeError::ExpirationExceedsAllowance`] — the entry's own
 ///    `signature_expiration_ledger` is later than `expected.valid_until_ledger`.
 ///    Checking only "not yet expired" (the previous check) bounds how late
 ///    is too late; it never bounded how *long-lived* an authorization the
@@ -157,10 +159,10 @@ fn is_valid_ed25519_signature(address: &Address, payload: &[u8; 32], scval: &ScV
 ///    verify_entry would pass it as long as it hadn't expired yet — found
 ///    reviewing a downstream binding that needed to read this field and
 ///    found nothing enforced it.
-/// 3. [`SorochargeError::UnexpectedInvocationShape`] — the entry doesn't
+/// 4. [`SorochargeError::UnexpectedInvocationShape`] — the entry doesn't
 ///    authorize a single, bare SEP-41 `transfer(from, to, amount)` call.
-/// 4. [`SorochargeError::AssetMismatch`] — the asset contract differs.
-/// 5. [`SorochargeError::PayerMismatch`] — the authorizing address (the
+/// 5. [`SorochargeError::AssetMismatch`] — the asset contract differs.
+/// 6. [`SorochargeError::PayerMismatch`] — the authorizing address (the
 ///    credential's address, which must also be the invocation's `from`)
 ///    differs from `expected.payer`. This check is not in the CLAUDE.md
 ///    section 5 checklist verbatim (which lists only asset/amount/recipient
@@ -169,10 +171,6 @@ fn is_valid_ed25519_signature(address: &Address, payload: &[u8; 32], scval: &ScV
 ///    asset/amount/recipient, regardless of whose key actually signed it —
 ///    added per this project's brief to resolve spec ambiguity toward the
 ///    more conservative reading.
-/// 6. [`SorochargeError::AmountNonPositive`] — `expected.amount` is zero or
-///    negative, which can never describe a valid SEP-41 transfer. Checked
-///    before the amount comparison so the caller learns its own request is
-///    invalid rather than merely "different from the entry".
 /// 7. [`SorochargeError::AmountMismatch`] — the amount differs.
 /// 8. [`SorochargeError::RecipientMismatch`] — the recipient differs.
 /// 9. [`SorochargeError::InvalidSignature`] — no signable node (the
@@ -193,6 +191,13 @@ pub fn verify_entry(
     current_ledger: u32,
     network_passphrase: &str,
 ) -> Result<(), SorochargeError> {
+    // A non-positive `expected.amount` is never a valid charge, independent
+    // of the entry being verified. Rejecting it first fails closed before any
+    // attacker-supplied XDR is decoded or compared.
+    if expected.amount <= 0 {
+        return Err(SorochargeError::AmountNonPositive);
+    }
+
     let xdr_entry = entry.as_xdr();
     let (authorizing_address, signable_nodes) =
         authorizing_address_and_signable_nodes(&xdr_entry.credentials)?;
@@ -220,11 +225,6 @@ pub fn verify_entry(
     if authorizing_address != expected.payer || transfer.from != expected.payer {
         return Err(SorochargeError::PayerMismatch);
     }
-    // A non-positive expected amount is invalid whether or not the entry
-    // matches it, so report it ahead of the (also failing) mismatch.
-    if expected.amount <= 0 {
-        return Err(SorochargeError::AmountNonPositive);
-    }
     if transfer.amount != expected.amount {
         return Err(SorochargeError::AmountMismatch);
     }
@@ -250,11 +250,10 @@ pub fn verify_entry(
 /// Verifies a Delegated entry's signatures against the account's actual
 /// threshold policy.
 ///
-/// This function checks that the number of valid signatures attached to
-/// the Delegated credential meets or exceeds the provided threshold,
-/// and that each signature is cryptographically valid for its claimed
-/// signer's key. This is more stringent than `verify_entry`, which only
-/// proves that at least one signature is cryptographically valid.
+/// Runs every check [`verify_entry`] performs — expiry, invocation shape,
+/// asset/payer/amount/recipient, and at least one valid signature — and then
+/// additionally requires the weighted valid signatures attached to the
+/// entry to meet or exceed `threshold`.
 ///
 /// # Errors
 ///
@@ -277,16 +276,16 @@ pub fn verify_delegated_threshold(
     signers_with_weights: &[(Address, u32)],
     threshold: u32,
 ) -> Result<(), SorochargeError> {
-    // Everything `verify_entry` checks (expiry against `current_ledger`, the
-    // charge parameters in `expected`, and at least one genuine signature),
-    // then the stricter weighted-threshold rule below.
+    // A threshold check on its own proves nothing about *what* was
+    // authorized: run every structural, expiry, and value check
+    // `verify_entry` performs first, then add the delegated-signature
+    // threshold on top. Without this, a caller reaching only for the
+    // weighted-signature check could accept an entry authorizing an
+    // entirely different transfer.
     verify_entry(entry, expected, current_ledger, network_passphrase)?;
 
     let xdr_entry = entry.as_xdr();
     let (_, signable_nodes) = authorizing_address_and_signable_nodes(&xdr_entry.credentials)?;
-
-    // Determine the minimum total weight needed.
-    let min_threshold = threshold;
 
     // Count how many of the signable nodes have valid signatures,
     // weighted by each signer's weight.
@@ -296,7 +295,7 @@ pub fn verify_delegated_threshold(
             // Find the signer's weight
             if let Some((_, weight)) = signers_with_weights
                 .iter()
-                .find(|(addr, _)| *addr == *address)
+                .find(|(addr, _)| addr == address)
             {
                 // Verify the signature is valid for this account's key
                 let Ok(verifying_key) = VerifyingKey::from_bytes(&pk_bytes) else {
@@ -317,7 +316,7 @@ pub fn verify_delegated_threshold(
         }
     }
 
-    if valid_sig_count < min_threshold {
+    if valid_sig_count < threshold {
         return Err(SorochargeError::InvalidSignature);
     }
 
@@ -614,5 +613,62 @@ mod tests {
             &f.network_passphrase,
         );
         assert_eq!(result, Err(SorochargeError::UnexpectedInvocationShape));
+    }
+
+    #[test]
+    fn delegated_threshold_requires_the_weighted_signature_count() {
+        let f = load();
+        let weights = [(f.expected.payer.clone(), 1u32)];
+
+        // The fixture's single valid signature (made by the payer's own
+        // key) carries weight 1, so a threshold of 1 is met...
+        assert_eq!(
+            verify_delegated_threshold(
+                &f.signed,
+                &f.expected,
+                f.valid_until_ledger - 1,
+                &f.network_passphrase,
+                &weights,
+                1,
+            ),
+            Ok(())
+        );
+
+        // ...and a threshold of 2 is not.
+        assert_eq!(
+            verify_delegated_threshold(
+                &f.signed,
+                &f.expected,
+                f.valid_until_ledger - 1,
+                &f.network_passphrase,
+                &weights,
+                2,
+            ),
+            Err(SorochargeError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn delegated_threshold_still_enforces_verify_entrys_checks() {
+        let f = load();
+        let weights = [(f.expected.payer.clone(), 1u32)];
+
+        // `verify_delegated_threshold` runs `verify_entry` first, so an
+        // expired entry is rejected with the same error `verify_entry`
+        // would produce, before the threshold is ever considered.
+        assert_eq!(
+            verify_delegated_threshold(
+                &f.signed,
+                &f.expected,
+                f.valid_until_ledger,
+                &f.network_passphrase,
+                &weights,
+                1,
+            ),
+            Err(SorochargeError::ExpiredEntry {
+                valid_until_ledger: f.valid_until_ledger,
+                current_ledger: f.valid_until_ledger,
+            })
+        );
     }
 }

@@ -1,0 +1,5 @@
+[toolchain]
+# cargo-fuzz needs a nightly compiler for the sanitizer/libFuzzer runtime.
+# This file scopes that requirement to `fuzz/` only; the library itself stays
+# on the stable pin declared by `rust-version` in the crate's Cargo.toml.
+channel = "nightly"
