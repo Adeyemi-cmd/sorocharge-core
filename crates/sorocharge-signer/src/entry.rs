@@ -267,6 +267,9 @@ pub(crate) fn build_charge_entry_with_nonce(
 #[cfg(test)]
 mod golden_vector_tests {
     use super::*;
+    use crate::sign::{sign_entry, Signer};
+    use crate::verify::verify_entry;
+    use ed25519_dalek::{Signer as DalekSigner, SigningKey};
     use serde::Deserialize;
     use stellar_xdr::{Limits, ReadXdr, WriteXdr};
 
@@ -606,5 +609,202 @@ mod golden_vector_tests {
         );
 
         assert_eq!(result, Err(SorochargeError::DuplicateDelegateSigner));
+    }
+
+    /// Pulls the `Int128Parts` the built entry encodes the transfer amount
+    /// as — the exact hi/lo split [`build_transfer_invocation`] produces,
+    /// and the structure a boundary off-by-one would hide in.
+    fn encoded_amount_parts(entry: &SorobanAuthorizationEntry) -> Int128Parts {
+        let SorobanAuthorizedFunction::ContractFn(invoke) = &entry.root_invocation.function else {
+            panic!("built entry should authorize a single contract call");
+        };
+        let [ScVal::Address(_), ScVal::Address(_), ScVal::I128(parts)] = invoke.args.as_slice()
+        else {
+            panic!("transfer invocation should carry (from, to, I128 amount) args");
+        };
+        parts.clone()
+    }
+
+    /// Diffs a built unsigned entry's XDR against its fixture byte for
+    /// byte, the same proof of reference-SDK equivalence every other
+    /// golden vector in this module provides.
+    fn assert_matches_fixture_xdr(unsigned: &UnsignedEntry, fixture: &Fixture) {
+        let expected = SorobanAuthorizationEntry::from_xdr_base64(
+            &fixture.unsigned_entry_xdr_base64,
+            Limits::none(),
+        )
+        .expect("fixture XDR should decode");
+
+        let actual_bytes = unsigned
+            .as_xdr()
+            .to_xdr(Limits::none())
+            .expect("constructed entry should encode to XDR");
+        let expected_bytes = expected
+            .to_xdr(Limits::none())
+            .expect("decoded fixture should re-encode to XDR");
+
+        assert_eq!(
+            actual_bytes, expected_bytes,
+            "sorocharge-signer's unsigned entry XDR must be byte-identical to @stellar/stellar-sdk 17.2.0's output"
+        );
+    }
+
+    /// The smallest possible positive transfer: 1 base unit, whose hi/lo
+    /// split is `(0, 1)` — the lower boundary of `Int128Parts`, where an
+    /// off-by-one that dropped or shifted the lowest bit would silently
+    /// corrupt the amount to 0 (or 2^64) without any mid-range fixture
+    /// noticing.
+    #[test]
+    fn legacy_transfer_of_one_base_unit_matches_reference_sdk_byte_for_byte() {
+        let fixture = load_fixture("legacy_transfer_min_amount");
+        assert_eq!(
+            fixture.amount, "1",
+            "fixture must pin the lower i128 amount boundary"
+        );
+
+        let params = ChargeParams {
+            asset_contract: fixture.asset_contract.parse::<ScAddress>().unwrap(),
+            amount: fixture.amount.parse().unwrap(),
+            payer: fixture.payer.parse::<ScAddress>().unwrap(),
+            recipient: fixture.recipient.parse::<ScAddress>().unwrap(),
+            valid_until_ledger: fixture.valid_until_ledger,
+        };
+        let nonce: i64 = fixture.nonce.parse().unwrap();
+
+        let unsigned = build_charge_entry_with_nonce(&params, CredentialKind::Legacy, nonce)
+            .expect("build_charge_entry_with_nonce should succeed for a 1-base-unit transfer");
+
+        let parts = encoded_amount_parts(unsigned.as_xdr());
+        assert_eq!(
+            (parts.hi, parts.lo),
+            (0, 1),
+            "amount 1 must encode as Int128Parts {{ hi: 0, lo: 1 }}"
+        );
+
+        assert_matches_fixture_xdr(&unsigned, &fixture);
+    }
+
+    /// The largest representable transfer: `i128::MAX`, whose hi/lo split
+    /// is `(i64::MAX, u64::MAX)` — the upper boundary, where every bit of
+    /// both halves is set, so a sign-extension, mask-width, or shift error
+    /// in the split (or in `verify_entry`'s reassembly) yields a different
+    /// value.
+    #[test]
+    fn legacy_transfer_of_i128_max_matches_reference_sdk_byte_for_byte() {
+        let fixture = load_fixture("legacy_transfer_max_amount");
+        assert_eq!(
+            fixture.amount,
+            i128::MAX.to_string(),
+            "fixture must pin the upper i128 amount boundary"
+        );
+
+        let params = ChargeParams {
+            asset_contract: fixture.asset_contract.parse::<ScAddress>().unwrap(),
+            amount: fixture.amount.parse().unwrap(),
+            payer: fixture.payer.parse::<ScAddress>().unwrap(),
+            recipient: fixture.recipient.parse::<ScAddress>().unwrap(),
+            valid_until_ledger: fixture.valid_until_ledger,
+        };
+        let nonce: i64 = fixture.nonce.parse().unwrap();
+
+        let unsigned = build_charge_entry_with_nonce(&params, CredentialKind::Legacy, nonce)
+            .expect("build_charge_entry_with_nonce should succeed for an i128::MAX transfer");
+
+        let parts = encoded_amount_parts(unsigned.as_xdr());
+        assert_eq!(
+            (parts.hi, parts.lo),
+            (i64::MAX, u64::MAX),
+            "amount i128::MAX must encode as Int128Parts {{ hi: i64::MAX, lo: u64::MAX }}"
+        );
+
+        assert_matches_fixture_xdr(&unsigned, &fixture);
+    }
+
+    /// An ed25519 signer for the fixture payer, using the same 32-byte seed
+    /// `generate.mjs` derives that payer from, so build→sign→verify runs
+    /// end-to-end on one key.
+    struct FixedSeedPayerSigner {
+        signing_key: SigningKey,
+        address: Address,
+    }
+
+    impl Signer for FixedSeedPayerSigner {
+        fn sign_preimage(&self, preimage: &[u8]) -> Result<[u8; 64], SorochargeError> {
+            Ok(self.signing_key.sign(preimage).to_bytes())
+        }
+
+        fn address(&self) -> Address {
+            self.address.clone()
+        }
+    }
+
+    /// Round-trips a boundary amount through the exact public path a caller
+    /// uses — [`build_charge_entry`] (with its real, random nonce),
+    /// [`sign_entry`], [`verify_entry`] — and then re-verifies with a
+    /// one-unit-smaller expectation to prove verification compares all 128
+    /// bits exactly. [`verify_entry`] reassembles `Int128Parts` back into
+    /// an `i128` before comparing, so `Ok(())` here proves the amount
+    /// survived the split and reassembly unchanged at this boundary.
+    fn assert_amount_round_trips_unchanged(amount: i128) {
+        let fixture = load_fixture("legacy_transfer");
+        let params = ChargeParams {
+            asset_contract: fixture.asset_contract.parse::<ScAddress>().unwrap(),
+            amount,
+            payer: fixture.payer.parse::<ScAddress>().unwrap(),
+            recipient: fixture.recipient.parse::<ScAddress>().unwrap(),
+            valid_until_ledger: fixture.valid_until_ledger,
+        };
+        let network_passphrase = "Test SDF Network ; September 2015";
+        let current_ledger = params.valid_until_ledger - 1;
+
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy)
+            .expect("build_charge_entry should succeed for any positive i128 amount");
+
+        let parts = encoded_amount_parts(unsigned.as_xdr());
+        assert_eq!(
+            (i128::from(parts.hi) << 64) | i128::from(parts.lo),
+            amount,
+            "the built entry's Int128Parts must reassemble to exactly the amount passed in"
+        );
+
+        let signer = FixedSeedPayerSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let signed = sign_entry(unsigned, &signer, network_passphrase)
+            .expect("sign_entry should succeed for the fixture payer's key");
+
+        assert_eq!(
+            verify_entry(&signed, &params, current_ledger, network_passphrase),
+            Ok(()),
+            "verify_entry must accept an entry whose amount matches exactly"
+        );
+
+        // Rejected off by exactly one unit: proof the check compares the
+        // full 128-bit amount, not a truncated or rounded half of it.
+        // Steps up rather than down (except at i128::MAX, where up would
+        // overflow) to stay clear of the AmountNonPositive check, which
+        // fires first for a non-positive expectation.
+        let mut off_by_one = params.clone();
+        off_by_one.amount = if amount < i128::MAX {
+            amount + 1
+        } else {
+            amount - 1
+        };
+        assert_eq!(
+            verify_entry(&signed, &off_by_one, current_ledger, network_passphrase),
+            Err(SorochargeError::AmountMismatch),
+            "verify_entry must reject an expectation exactly one base unit away from the boundary"
+        );
+    }
+
+    #[test]
+    fn amount_one_round_trips_unchanged_through_build_sign_and_verify() {
+        assert_amount_round_trips_unchanged(1);
+    }
+
+    #[test]
+    fn amount_i128_max_round_trips_unchanged_through_build_sign_and_verify() {
+        assert_amount_round_trips_unchanged(i128::MAX);
     }
 }
