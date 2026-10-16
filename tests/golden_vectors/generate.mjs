@@ -38,10 +38,17 @@ const recipient = recipientKeypair.publicKey();
 const assetContract = StrKey.encodeContract(fixedSeed(0x33));
 
 const amount = 1000000000n; // 100.0000000 units of a 7-decimal SEP-41 asset
+// The two numeric boundaries of the i128 amount field: the smallest
+// possible positive transfer, and the largest representable value. Each
+// exercises a different edge of Int128Parts' hi/lo split (hi = 0, lo = 1
+// versus hi = i64::MAX, lo = u64::MAX), where an off-by-one would silently
+// corrupt the amount.
+const minAmount = 1n;
+const maxAmount = (1n << 127n) - 1n; // i128::MAX
 const validUntilLedger = 123456;
 const nonce = 42n; // fixed for reproducibility; a real client uses a random nonce
 
-function buildTransferInvocation() {
+function buildTransferInvocation(amount) {
   const invokeArgs = new xdr.InvokeContractArgs({
     contractAddress: new Address(assetContract).toScAddress(),
     functionName: "transfer",
@@ -61,7 +68,7 @@ function buildTransferInvocation() {
   });
 }
 
-function buildLegacyEntry() {
+function buildLegacyEntry(amount) {
   const addressCredentials = new xdr.SorobanAddressCredentials({
     address: new Address(payer).toScAddress(),
     nonce,
@@ -72,7 +79,7 @@ function buildLegacyEntry() {
   return new xdr.SorobanAuthorizationEntry({
     credentials:
       xdr.SorobanCredentials.sorobanCredentialsAddress(addressCredentials),
-    rootInvocation: buildTransferInvocation(),
+    rootInvocation: buildTransferInvocation(amount),
   });
 }
 
@@ -87,7 +94,7 @@ function buildAddressV2Entry() {
   return new xdr.SorobanAuthorizationEntry({
     credentials:
       xdr.SorobanCredentials.sorobanCredentialsAddressV2(addressCredentials),
-    rootInvocation: buildTransferInvocation(),
+    rootInvocation: buildTransferInvocation(amount),
   });
 }
 
@@ -111,7 +118,7 @@ function buildDelegatedEntry() {
 
   const entryWithoutDelegates = new xdr.SorobanAuthorizationEntry({
     credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(addressCredentials),
-    rootInvocation: buildTransferInvocation(),
+    rootInvocation: buildTransferInvocation(amount),
   });
 
   const entry = buildWithDelegatesEntry({
@@ -151,7 +158,7 @@ function buildManyDelegatesEntry() {
 
   const entryWithoutDelegates = new xdr.SorobanAuthorizationEntry({
     credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(addressCredentials),
-    rootInvocation: buildTransferInvocation(),
+    rootInvocation: buildTransferInvocation(amount),
   });
 
   const entry = buildWithDelegatesEntry({
@@ -164,16 +171,20 @@ function buildManyDelegatesEntry() {
 }
 
 function writeFixture(name, entry, extra = {}, xdrField = "unsigned_entry_xdr_base64") {
+  // `extra.amount` (a BigInt) overrides the module-level default amount;
+  // it must be stringified here because JSON.stringify cannot serialize a
+  // BigInt, and is pulled out of `extra` before the spread below.
+  const { amount: fixtureAmount = amount, ...rest } = extra;
   const fixture = {
     description: `${name}: a SorobanAuthorizationEntry for a SEP-41 transfer`,
     sdk_version: "17.2.0",
     asset_contract: assetContract,
     payer,
     recipient,
-    amount: amount.toString(),
+    amount: fixtureAmount.toString(),
     valid_until_ledger: validUntilLedger,
     nonce: nonce.toString(),
-    ...extra,
+    ...rest,
     [xdrField]: entry.toXdr("base64"),
   };
   const path = join(fixturesDir, `${name}.json`);
@@ -181,8 +192,22 @@ function writeFixture(name, entry, extra = {}, xdrField = "unsigned_entry_xdr_ba
   console.log(`wrote ${path}`);
 }
 
-writeFixture("legacy_transfer", buildLegacyEntry());
+writeFixture("legacy_transfer", buildLegacyEntry(amount));
 writeFixture("address_v2_transfer", buildAddressV2Entry());
+
+// The two numeric boundaries of the i128 amount field, both through the
+// same legacy-credential builder so the only variable under test is the
+// amount's Int128Parts hi/lo encoding.
+writeFixture("legacy_transfer_min_amount", buildLegacyEntry(minAmount), {
+  description:
+    "legacy_transfer_min_amount: a transfer of 1 base unit, the smallest possible positive i128 amount, exercising the Int128Parts hi/lo split at its lower boundary (hi = 0, lo = 1)",
+  amount: minAmount,
+});
+writeFixture("legacy_transfer_max_amount", buildLegacyEntry(maxAmount), {
+  description:
+    "legacy_transfer_max_amount: a transfer of i128::MAX, the largest representable i128 amount, exercising the Int128Parts hi/lo split at its upper boundary (hi = i64::MAX, lo = u64::MAX)",
+  amount: maxAmount,
+});
 
 const delegated = buildDelegatedEntry();
 writeFixture("delegated_transfer", delegated.entry, {
@@ -203,7 +228,7 @@ writeFixture("delegated_transfer_many_signers", manyDelegates.entry, {
 
 const networkPassphrase = Networks.TESTNET;
 const signedLegacyEntry = await authorizeEntry(
-  buildLegacyEntry(),
+  buildLegacyEntry(amount),
   payerKeypair,
   validUntilLedger,
   networkPassphrase,
