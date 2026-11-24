@@ -169,6 +169,32 @@ pub(crate) fn entry_expiration_ledger(
 /// this crate bakes into each signing payload, rather than each carrying
 /// its own copy of the identical five lines (a drift risk this project's
 /// "one audited signing engine, not two" brief exists to prevent).
+///
+/// # Examples
+///
+/// ```
+/// use sorocharge_signer::network_id_hash;
+///
+/// fn hex(bytes: &[u8]) -> String {
+///     bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// }
+///
+/// // The well-known Stellar testnet and pubnet network IDs.
+/// let testnet = network_id_hash("Test SDF Network ; September 2015");
+/// assert_eq!(
+///     hex(&testnet),
+///     "cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+/// );
+/// let pubnet = network_id_hash("Public Global Stellar Network ; September 2015");
+/// assert_eq!(
+///     hex(&pubnet),
+///     "7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979",
+/// );
+///
+/// // The hash is over the exact passphrase bytes: any difference, even
+/// // trailing whitespace, yields a different network.
+/// assert_ne!(network_id_hash("Test SDF Network ; September 2015 "), testnet);
+/// ```
 #[must_use]
 pub fn network_id_hash(network_passphrase: &str) -> [u8; 32] {
     Sha256::digest(network_passphrase.as_bytes()).into()

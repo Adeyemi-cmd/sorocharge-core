@@ -579,24 +579,109 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bounded_fields_exactly_at_their_maximum_length_are_accepted_verbatim() {
-        let realm = "r".repeat(MAX_REALM_LEN);
-        let description = "d".repeat(MAX_DESCRIPTION_LEN);
+    // ---- MAX_REALM_LEN boundary (#247) ----------------------------------
+    //
+    // Every test below goes through `serde_json::from_str`, i.e. the real
+    // `deserialize_with = "deserialize_realm"` path, never `enforce_max`
+    // directly — an off-by-one in the comparison (`>=` for `>`) or a field
+    // that silently lost its `deserialize_with` attribute would fail here.
 
-        let challenge: Challenge =
-            serde_json::from_str(&challenge_json(&realm, Some(description.clone())))
-                .expect("at-limit values must decode");
-        assert_eq!(challenge.realm, realm);
+    #[test]
+    fn challenge_realm_of_exactly_max_realm_len_bytes_is_accepted_verbatim() {
+        let realm = "r".repeat(MAX_REALM_LEN);
+        assert_eq!(realm.len(), MAX_REALM_LEN);
+
+        let challenge: Challenge = serde_json::from_str(&challenge_json(&realm, None))
+            .expect("a realm of exactly MAX_REALM_LEN bytes must decode");
+        assert_eq!(
+            challenge.realm, realm,
+            "an at-limit realm must not be altered"
+        );
+    }
+
+    #[test]
+    fn challenge_realm_one_byte_over_max_realm_len_is_rejected_naming_the_field() {
+        let realm = "r".repeat(MAX_REALM_LEN + 1);
+        assert_field_too_long::<Challenge>(
+            &challenge_json(&realm, None),
+            "realm",
+            MAX_REALM_LEN,
+            MAX_REALM_LEN + 1,
+        );
+    }
+
+    #[test]
+    fn challenge_realm_multibyte_boundary_is_measured_in_bytes() {
+        // MAX_REALM_LEN (253) is odd, so 126 two-byte "é" plus one ASCII
+        // byte lands exactly on the limit; 127 "é" is one byte over while
+        // being *fewer* characters than the accepted value.
+        let at_limit = format!("{}r", "é".repeat(MAX_REALM_LEN / 2));
+        assert_eq!(at_limit.len(), MAX_REALM_LEN);
+        let challenge: Challenge = serde_json::from_str(&challenge_json(&at_limit, None))
+            .expect("a multibyte realm of exactly MAX_REALM_LEN bytes must decode");
+        assert_eq!(challenge.realm, at_limit);
+
+        let over = "é".repeat(MAX_REALM_LEN / 2 + 1);
+        assert_eq!(over.len(), MAX_REALM_LEN + 1);
+        assert_field_too_long::<Challenge>(
+            &challenge_json(&over, None),
+            "realm",
+            MAX_REALM_LEN,
+            MAX_REALM_LEN + 1,
+        );
+    }
+
+    // ---- MAX_DESCRIPTION_LEN boundary (#246) ----------------------------
+    //
+    // `description` appears on both `Challenge` and `ChargeRequest`, each
+    // with its own `deserialize_with` attribute, so both are pinned.
+
+    #[test]
+    fn challenge_description_of_exactly_max_description_len_bytes_is_accepted_verbatim() {
+        let description = "d".repeat(MAX_DESCRIPTION_LEN);
+        assert_eq!(description.len(), MAX_DESCRIPTION_LEN);
+
+        let challenge: Challenge = serde_json::from_str(&challenge_json(
+            "api.example.com",
+            Some(description.clone()),
+        ))
+        .expect("a description of exactly MAX_DESCRIPTION_LEN bytes must decode");
         assert_eq!(challenge.description.as_deref(), Some(description.as_str()));
+    }
+
+    #[test]
+    fn charge_request_description_of_exactly_max_description_len_bytes_is_accepted_verbatim() {
+        let description = "d".repeat(MAX_DESCRIPTION_LEN);
 
         let request: ChargeRequest =
             serde_json::from_str(&charge_request_json(description.clone()))
-                .expect("at-limit values must decode");
+                .expect("a description of exactly MAX_DESCRIPTION_LEN bytes must decode");
         assert_eq!(request.description.as_deref(), Some(description.as_str()));
+    }
 
-        // An absent or null description still decodes to `None`.
-        let challenge: Challenge = serde_json::from_str(&challenge_json(&realm, None))
+    #[test]
+    fn description_multibyte_boundary_is_measured_in_bytes() {
+        // 1024 two-byte "é" is exactly MAX_DESCRIPTION_LEN bytes; one more
+        // ASCII byte pushes it one byte over.
+        let at_limit = "é".repeat(MAX_DESCRIPTION_LEN / 2);
+        assert_eq!(at_limit.len(), MAX_DESCRIPTION_LEN);
+        let request: ChargeRequest = serde_json::from_str(&charge_request_json(at_limit.clone()))
+            .expect("a multibyte description of exactly MAX_DESCRIPTION_LEN bytes must decode");
+        assert_eq!(request.description.as_deref(), Some(at_limit.as_str()));
+
+        let over = format!("{at_limit}d");
+        assert_eq!(over.len(), MAX_DESCRIPTION_LEN + 1);
+        assert_field_too_long::<ChargeRequest>(
+            &charge_request_json(over),
+            "description",
+            MAX_DESCRIPTION_LEN,
+            MAX_DESCRIPTION_LEN + 1,
+        );
+    }
+
+    #[test]
+    fn absent_or_null_description_still_decodes_to_none() {
+        let challenge: Challenge = serde_json::from_str(&challenge_json("api.example.com", None))
             .expect("null description must decode");
         assert_eq!(challenge.description, None);
     }
